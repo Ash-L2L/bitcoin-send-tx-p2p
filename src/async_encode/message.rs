@@ -3,7 +3,7 @@ use std::io::Cursor;
 
 use async_trait::async_trait;
 use bitcoin::{
-    consensus::encode::{CheckedData, Error},
+    consensus::encode::{self, CheckedData},
     p2p::{
         message::{CommandString, NetworkMessage, RawNetworkMessage},
         message_network::VersionMessage,
@@ -12,7 +12,7 @@ use bitcoin::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::async_encode::encode::AsyncDecodable;
+use crate::async_encode::encode::{AsyncDecodable, DecodeError};
 
 const MAX_MSG_SIZE: usize = 5_000_000;
 
@@ -20,26 +20,39 @@ const MAX_MSG_SIZE: usize = 5_000_000;
 impl AsyncDecodable for RawNetworkMessage {
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        let magic = AsyncDecodable::async_consensus_decode_from_finite_reader(r).await?;
-        let cmd = CommandString::async_consensus_decode_from_finite_reader(r).await?;
+    ) -> Result<Self, DecodeError<Self>> {
+        let magic = AsyncDecodable::async_consensus_decode_from_finite_reader(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
+        let cmd = CommandString::async_consensus_decode_from_finite_reader(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
         let raw_payload = CheckedData::async_consensus_decode_from_finite_reader(r)
-            .await?
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?
             .into_data();
         let mut mem_d = Cursor::new(raw_payload);
         let payload = match cmd.as_ref() {
             "version" => NetworkMessage::Version(
-                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d).await?,
+                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
             ),
             "verack" => NetworkMessage::Verack,
             "getdata" => NetworkMessage::GetData(
-                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d).await?,
+                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
             ),
             "ping" => NetworkMessage::Ping(
-                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d).await?,
+                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
             ),
             "alert" => NetworkMessage::Alert(
-                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d).await?,
+                AsyncDecodable::async_consensus_decode_from_finite_reader(&mut mem_d)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
             ),
             "wtxidrelay" => NetworkMessage::WtxidRelay,
             "sendaddrv2" => NetworkMessage::SendAddrV2,
@@ -54,7 +67,7 @@ impl AsyncDecodable for RawNetworkMessage {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         Self::async_consensus_decode_from_finite_reader(r.take(MAX_MSG_SIZE as u64).get_mut()).await
     }
 }
@@ -64,8 +77,10 @@ impl AsyncDecodable for CommandString {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        let rawbytes: [u8; 12] = AsyncDecodable::async_consensus_decode(r).await?;
+    ) -> Result<Self, DecodeError<Self>> {
+        let rawbytes: [u8; 12] = AsyncDecodable::async_consensus_decode(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
         let rv: String = FromIterator::from_iter(rawbytes.iter().filter_map(|&u| {
             if u > 0 {
                 Some(u as char)
@@ -74,7 +89,7 @@ impl AsyncDecodable for CommandString {
             }
         }));
         Ok(CommandString::try_from(rv)
-            .map_err(|_| Error::ParseFailed("Failed to parse CommandString"))?)
+            .map_err(|_| encode::Error::ParseFailed("Failed to parse CommandString"))?)
     }
 }
 
@@ -87,20 +102,20 @@ macro_rules! impl_consensus_encoding {
             #[inline]
             async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
                 r: &mut R,
-            ) -> Result<$thing, Error> {
+            ) -> Result<$thing, DecodeError<Self>> {
                 Ok($thing {
-                    $($field: AsyncDecodable::async_consensus_decode_from_finite_reader(r).await?),+
+                    $($field: AsyncDecodable::async_consensus_decode_from_finite_reader(r).await.map_err(|err| DecodeError::new(err.into()))?),+
                 })
             }
 
             #[inline]
             async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
                 r: &mut R,
-            ) -> Result<$thing, Error> {
+            ) -> Result<$thing, DecodeError<Self>> {
                 use tokio::io::AsyncReadExt as _;
                 let mut r = r.take(bitcoin::consensus::encode::MAX_VEC_SIZE as u64);
                 Ok($thing {
-                    $($field: AsyncDecodable::async_consensus_decode(r.get_mut()).await?),+
+                    $($field: AsyncDecodable::async_consensus_decode(r.get_mut()).await.map_err(|err| DecodeError::new(err.into()))?),+
                 })
             }
         }
@@ -127,12 +142,18 @@ impl AsyncDecodable for ServiceFlags {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        Ok(ServiceFlags::from(u64::async_consensus_decode(r).await?))
+    ) -> Result<Self, DecodeError<Self>> {
+        Ok(ServiceFlags::from(
+            u64::async_consensus_decode(r)
+                .await
+                .map_err(|err| DecodeError::new(err.into()))?,
+        ))
     }
 }
 
-async fn read_be_address<R: AsyncRead + Sized + Unpin>(r: &mut R) -> Result<[u16; 8], Error> {
+async fn read_be_address<R: AsyncRead + Sized + Unpin>(
+    r: &mut R,
+) -> Result<[u16; 8], DecodeError<[u16; 8]>> {
     let mut address = [0u16; 8];
     let mut buf = [0u8; 2];
 
@@ -150,11 +171,19 @@ impl AsyncDecodable for Address {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         Ok(Address {
-            services: AsyncDecodable::async_consensus_decode(r).await?,
-            address: read_be_address(r).await?,
-            port: u16::swap_bytes(AsyncDecodable::async_consensus_decode(r).await?),
+            services: AsyncDecodable::async_consensus_decode(r)
+                .await
+                .map_err(|err| DecodeError::new(err.into()))?,
+            address: read_be_address(r)
+                .await
+                .map_err(|err| DecodeError::new(err.into()))?,
+            port: u16::swap_bytes(
+                AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
+            ),
         })
     }
 }

@@ -4,4 +4,5 @@
 mod encode;
 mod message;
 
-pub use self::encode::AsyncDecodable;
+pub use encode::DecodeErrorErased;
+pub(crate) use encode::{AsyncDecodable, DecodeError};

@@ -1,12 +1,13 @@
-use core::mem;
+use core::{marker::PhantomData, mem};
 
 use async_trait::async_trait;
 use bitcoin::{
-    consensus::encode::{CheckedData, Error, MAX_VEC_SIZE},
+    consensus::encode::{self, CheckedData, MAX_VEC_SIZE},
     hashes::{sha256d, Hash as _},
     p2p::{message_blockdata::Inventory, Magic},
     BlockHash, Txid, VarInt, Wtxid,
 };
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[async_trait]
@@ -17,19 +18,93 @@ pub trait AsyncEncodable: Sized {
     ) -> Result<usize, std::io::Error>;
 }
 
+/// Wrapper for decode error that includes a type in the error message
+#[derive(Debug, Error)]
+pub(crate) enum DecodeErrorSource {
+    #[error(transparent)]
+    Decode(encode::Error),
+    #[error(transparent)]
+    Inner(#[from] Box<DecodeErrorErased>),
+}
+
+impl<Err> From<Err> for DecodeErrorSource
+where
+    encode::Error: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self::Decode(err.into())
+    }
+}
+
+/// Wrapper for decode error that includes a type in the error message,
+/// where the decoded type is erased
+#[derive(Debug, Error)]
+#[error("Failed to decode {type_name}")]
+pub struct DecodeErrorErased {
+    source: DecodeErrorSource,
+    type_name: &'static str,
+}
+
+impl From<DecodeErrorErased> for DecodeErrorSource {
+    fn from(inner: DecodeErrorErased) -> Self {
+        Self::Inner(Box::new(inner))
+    }
+}
+
+/// Wrapper for decode error that includes the type in the error message
+#[derive(Debug, Error)]
+#[error("Failed to decode {}", core::any::type_name::<T>())]
+pub(crate) struct DecodeError<T> {
+    source: DecodeErrorSource,
+    _marker: PhantomData<T>,
+}
+
+impl<T> DecodeError<T> {
+    pub fn new(source: DecodeErrorSource) -> Self {
+        Self {
+            source,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> From<DecodeError<T>> for DecodeErrorErased {
+    fn from(err: DecodeError<T>) -> Self {
+        Self {
+            source: err.source,
+            type_name: core::any::type_name::<T>(),
+        }
+    }
+}
+
+impl<T> From<DecodeError<T>> for DecodeErrorSource {
+    fn from(inner: DecodeError<T>) -> Self {
+        DecodeErrorErased::from(inner).into()
+    }
+}
+
+impl<T, Err> From<Err> for DecodeError<T>
+where
+    encode::Error: From<Err>,
+{
+    fn from(err: Err) -> Self {
+        Self::new(err.into())
+    }
+}
+
 #[async_trait]
-pub trait AsyncDecodable: Sized {
+pub(crate) trait AsyncDecodable: Sized {
     #[inline]
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         reader: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         Self::async_consensus_decode(reader).await
     }
 
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         reader: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         Self::async_consensus_decode_from_finite_reader(reader.take(MAX_VEC_SIZE as u64).get_mut())
             .await
     }
@@ -43,7 +118,7 @@ macro_rules! impl_int_encodable {
             #[inline]
             async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
                 r: &mut R,
-            ) -> Result<Self, Error> {
+            ) -> Result<Self, DecodeError<Self>> {
                 AsyncReadExt::$meth_dec(r)
                     .await
                     .map_err(|err| bitcoin::io::Error::from(err).into())
@@ -77,7 +152,7 @@ impl AsyncDecodable for VarInt {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         let n = AsyncReadExt::read_u8(r)
             .await
             .map_err(bitcoin::io::Error::from)?;
@@ -87,7 +162,7 @@ impl AsyncDecodable for VarInt {
                     .await
                     .map_err(bitcoin::io::Error::from)?;
                 if x < 0x100000000 {
-                    Err(self::Error::NonMinimalVarInt)
+                    Err(encode::Error::NonMinimalVarInt.into())
                 } else {
                     Ok(VarInt(x))
                 }
@@ -97,7 +172,7 @@ impl AsyncDecodable for VarInt {
                     .await
                     .map_err(bitcoin::io::Error::from)?;
                 if x < 0x10000 {
-                    Err(self::Error::NonMinimalVarInt)
+                    Err(encode::Error::NonMinimalVarInt.into())
                 } else {
                     Ok(VarInt(x as u64))
                 }
@@ -107,7 +182,7 @@ impl AsyncDecodable for VarInt {
                     .await
                     .map_err(bitcoin::io::Error::from)?;
                 if x < 0xFD {
-                    Err(self::Error::NonMinimalVarInt)
+                    Err(encode::Error::NonMinimalVarInt.into())
                 } else {
                     Ok(VarInt(x as u64))
                 }
@@ -153,7 +228,7 @@ impl AsyncDecodable for bool {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         AsyncReadExt::read_i8(r)
             .await
             .map_err(|err| bitcoin::io::Error::from(err).into())
@@ -166,9 +241,12 @@ impl AsyncDecodable for String {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        String::from_utf8(AsyncDecodable::async_consensus_decode(r).await?)
-            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+    ) -> Result<Self, DecodeError<Self>> {
+        let utf8: Vec<u8> = AsyncDecodable::async_consensus_decode(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
+        String::from_utf8(utf8)
+            .map_err(|_| encode::Error::ParseFailed("String was not valid UTF8").into())
     }
 }
 
@@ -191,7 +269,7 @@ macro_rules! impl_array {
             #[inline]
             async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
                 r: &mut R,
-            ) -> Result<Self, Error> {
+            ) -> Result<Self, DecodeError<Self>> {
                 let mut ret = [0; $size];
                 r.read_exact(&mut ret)
                     .await
@@ -217,10 +295,12 @@ impl AsyncDecodable for [u16; 8] {
     #[inline]
     async fn async_consensus_decode<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         let mut res = [0; 8];
         for item in &mut res {
-            *item = AsyncDecodable::async_consensus_decode(r).await?;
+            *item = AsyncDecodable::async_consensus_decode(r)
+                .await
+                .map_err(|err| DecodeError::new(err.into()))?;
         }
         Ok(res)
     }
@@ -235,9 +315,10 @@ macro_rules! impl_vec {
                 R: AsyncRead + Sized + Send + Unpin,
             >(
                 r: &mut R,
-            ) -> Result<Self, Error> {
+            ) -> Result<Self, DecodeError<Self>> {
                 let len = VarInt::async_consensus_decode_from_finite_reader(r)
-                    .await?
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?
                     .0;
                 // Do not allocate upfront more items than if the sequnce of type
                 // occupied roughly quarter a block. This should never be the case
@@ -248,7 +329,10 @@ macro_rules! impl_vec {
                 let max_capacity = MAX_VEC_SIZE / 4 / mem::size_of::<$type>();
                 let mut ret = Vec::with_capacity(core::cmp::min(len as usize, max_capacity));
                 for _ in 0..len {
-                    ret.push(AsyncDecodable::async_consensus_decode_from_finite_reader(r).await?);
+                    let item = AsyncDecodable::async_consensus_decode_from_finite_reader(r)
+                        .await
+                        .map_err(|err| DecodeError::new(err.into()))?;
+                    ret.push(item);
                 }
                 Ok(ret)
             }
@@ -268,20 +352,47 @@ impl AsyncDecodable for Inventory {
     #[inline]
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        let inv_type: u32 = AsyncDecodable::async_consensus_decode(r).await?;
+    ) -> Result<Self, DecodeError<Self>> {
+        let inv_type: u32 = AsyncDecodable::async_consensus_decode(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
         Ok(match inv_type {
             0 => Inventory::Error,
-            1 => Inventory::Transaction(AsyncDecodable::async_consensus_decode(r).await?),
-            2 => Inventory::Block(AsyncDecodable::async_consensus_decode(r).await?),
-            5 => Inventory::WTx(AsyncDecodable::async_consensus_decode(r).await?),
-            0x40000001 => {
-                Inventory::WitnessTransaction(AsyncDecodable::async_consensus_decode(r).await?)
+            1 => {
+                let tx = AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?;
+                Inventory::Transaction(tx)
             }
-            0x40000002 => Inventory::WitnessBlock(AsyncDecodable::async_consensus_decode(r).await?),
+            2 => {
+                let block = AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?;
+                Inventory::Block(block)
+            }
+            5 => {
+                let wtx = AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?;
+                Inventory::WTx(wtx)
+            }
+            0x40000001 => {
+                let witness_transaction = AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?;
+                Inventory::WitnessTransaction(witness_transaction)
+            }
+            0x40000002 => {
+                let witness_block = AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?;
+                Inventory::WitnessBlock(witness_block)
+            }
             tp => Inventory::Unknown {
                 inv_type: tp,
-                hash: AsyncDecodable::async_consensus_decode(r).await?,
+                hash: AsyncDecodable::async_consensus_decode(r)
+                    .await
+                    .map_err(|err| DecodeError::new(err.into()))?,
             },
         })
     }
@@ -296,7 +407,7 @@ struct ReadBytesFromFiniteReaderOpts {
 async fn read_bytes_from_finite_reader<D: AsyncRead + Sized + Send + Unpin>(
     mut d: D,
     mut opts: ReadBytesFromFiniteReaderOpts,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, DecodeError<Vec<u8>>> {
     let mut ret = vec![];
 
     assert_ne!(opts.chunk_size, 0);
@@ -320,8 +431,11 @@ impl AsyncDecodable for Vec<u8> {
     #[inline]
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        let len = VarInt::async_consensus_decode(r).await?.0 as usize;
+    ) -> Result<Self, DecodeError<Self>> {
+        let len = VarInt::async_consensus_decode(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?
+            .0 as usize;
         // most real-world vec of bytes data, wouldn't be larger than 128KiB
         read_bytes_from_finite_reader(
             r,
@@ -344,10 +458,14 @@ impl AsyncDecodable for CheckedData {
     #[inline]
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
-        let len = u32::async_consensus_decode_from_finite_reader(r).await? as usize;
+    ) -> Result<Self, DecodeError<Self>> {
+        let len = u32::async_consensus_decode_from_finite_reader(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))? as usize;
 
-        let checksum = <[u8; 4]>::async_consensus_decode_from_finite_reader(r).await?;
+        let checksum = <[u8; 4]>::async_consensus_decode_from_finite_reader(r)
+            .await
+            .map_err(|err| DecodeError::new(err.into()))?;
         let ret = read_bytes_from_finite_reader(
             r,
             ReadBytesFromFiniteReaderOpts {
@@ -355,13 +473,15 @@ impl AsyncDecodable for CheckedData {
                 chunk_size: MAX_VEC_SIZE,
             },
         )
-        .await?;
+        .await
+        .map_err(|err| DecodeError::new(err.into()))?;
         let expected_checksum = sha2_checksum(&ret);
         if expected_checksum != checksum {
-            Err(self::Error::InvalidChecksum {
+            Err(encode::Error::InvalidChecksum {
                 expected: expected_checksum,
                 actual: checksum,
-            })
+            }
+            .into())
         } else {
             Ok(CheckedData::new(ret))
         }
@@ -377,9 +497,11 @@ macro_rules! impl_sha256d {
                 R: AsyncRead + Sized + Send + Unpin,
             >(
                 r: &mut R,
-            ) -> Result<Self, Error> {
+            ) -> Result<Self, DecodeError<Self>> {
                 Ok(Self::from_byte_array(
-                    <[u8; 32]>::async_consensus_decode(r).await?,
+                    <[u8; 32]>::async_consensus_decode(r)
+                        .await
+                        .map_err(|err| DecodeError::new(err.into()))?,
                 ))
             }
         }
@@ -395,9 +517,11 @@ impl AsyncDecodable for Magic {
     #[inline]
     async fn async_consensus_decode_from_finite_reader<R: AsyncRead + Sized + Send + Unpin>(
         r: &mut R,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, DecodeError<Self>> {
         Ok(Self::from_bytes(
-            <[u8; 4]>::async_consensus_decode_from_finite_reader(r).await?,
+            <[u8; 4]>::async_consensus_decode_from_finite_reader(r)
+                .await
+                .map_err(|err| DecodeError::new(err.into()))?,
         ))
     }
 }
