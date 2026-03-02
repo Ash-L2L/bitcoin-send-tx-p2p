@@ -193,12 +193,15 @@ async fn send_tx_p2p(
 
     if let Ok(Ok(_)) = result {
         info!("Sent tx successfully");
+        const WAIT_BEFORE_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+        tokio::time::sleep(WAIT_BEFORE_SHUTDOWN).await;
     }
 
     trace!("Disconnecting");
     // Ignore error on shutdown, since we might have already broadcasted successfully
-    let _ = stream.shutdown().await;
-
+    if let Err(err) = stream.shutdown().await {
+        log::error!("{err}")
+    };
     result?
 }
 
